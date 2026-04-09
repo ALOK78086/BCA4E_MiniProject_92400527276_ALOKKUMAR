@@ -1,0 +1,1207 @@
+import math
+import os
+import random
+import sys
+
+import pygame
+from database import init_database, load_game_data, record_match
+
+pygame.init()
+
+# ---------------- AUDIO INIT ----------------
+audio_ok = True
+try:
+    pygame.mixer.init()
+except Exception as e:
+    print("Audio init failed:", e)
+    audio_ok = False
+
+# ---------------- SCREEN ----------------
+WIDTH = 1600
+HEIGHT = 900
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Free Fire 2D - Battle Arena")
+
+clock = pygame.time.Clock()
+FPS = 60
+
+# ---------------- COLORS ----------------
+WHITE = (255, 255, 255)
+BLACK = (10, 10, 12)
+CYAN = (90, 240, 255)
+YELLOW = (255, 215, 72)
+GREEN = (60, 220, 130)
+RED = (255, 90, 90)
+ORANGE = (255, 150, 70)
+GRAY = (190, 190, 190)
+DARK = (20, 24, 30)
+MAP_GRASS = (58, 110, 65)
+MAP_GRASS_2 = (73, 130, 78)
+MAP_ROAD = (114, 108, 94)
+MAP_WATER = (58, 122, 176)
+MAP_BUILDING = (137, 102, 74)
+ZONE_BLUE = (70, 170, 255)
+ZONE_WARNING = (255, 180, 70)
+
+# ---------------- FONTS ----------------
+font = pygame.font.SysFont("arial", 28)
+small_font = pygame.font.SysFont("arial", 22)
+big_font = pygame.font.SysFont("arial", 64)
+
+DB_PATH = "game_data.db"
+
+
+def load_image_safe(path, size=None):
+    if not os.path.exists(path):
+        return None
+    try:
+        img = pygame.image.load(path).convert_alpha()
+        if size:
+            img = pygame.transform.smoothscale(img, size)
+        return img
+    except Exception as e:
+        print(f"Image load failed: {path} -> {e}")
+        return None
+
+
+def load_sound_safe(path, volume=0.5):
+    if not audio_ok or not os.path.exists(path):
+        return None
+    try:
+        snd = pygame.mixer.Sound(path)
+        snd.set_volume(volume)
+        return snd
+    except Exception as e:
+        print(f"Sound load failed: {path} -> {e}")
+        return None
+
+
+def draw_text(text, color, x, y, use_small=False):
+    use_font = small_font if use_small else font
+    img = use_font.render(text, True, color)
+    screen.blit(img, (x, y))
+
+
+def draw_center_text(text, color, y, use_big=False):
+    use_font = big_font if use_big else font
+    img = use_font.render(text, True, color)
+    rect = img.get_rect(center=(WIDTH // 2, y))
+    screen.blit(img, rect)
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def lerp(a, b, factor):
+    return a + (b - a) * factor
+
+
+def format_seconds(total_seconds):
+    minutes = int(total_seconds) // 60
+    seconds = int(total_seconds) % 60
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def draw_vertical_gradient(surface, top_color, bottom_color):
+    for y in range(surface.get_height()):
+        ratio = y / max(1, surface.get_height() - 1)
+        color = (
+            int(lerp(top_color[0], bottom_color[0], ratio)),
+            int(lerp(top_color[1], bottom_color[1], ratio)),
+            int(lerp(top_color[2], bottom_color[2], ratio)),
+        )
+        pygame.draw.line(surface, color, (0, y), (surface.get_width(), y))
+
+
+def distance(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def angle_to_vector(angle):
+    return math.cos(angle), math.sin(angle)
+
+
+def normalize_vector(dx, dy):
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return 0, 0
+    return dx / length, dy / length
+
+
+def point_in_circle(point, center, radius):
+    return distance(point, center) <= radius
+
+
+def line_intersects_rect(start, end, rect):
+    clipped = rect.clipline(start, end)
+    return bool(clipped)
+
+
+def move_with_collisions(entity_rect, dx, dy, walls):
+    entity_rect.x += int(dx)
+    for wall in walls:
+        if entity_rect.colliderect(wall):
+            if dx > 0:
+                entity_rect.right = wall.left
+            elif dx < 0:
+                entity_rect.left = wall.right
+
+    entity_rect.y += int(dy)
+    for wall in walls:
+        if entity_rect.colliderect(wall):
+            if dy > 0:
+                entity_rect.bottom = wall.top
+            elif dy < 0:
+                entity_rect.top = wall.bottom
+
+    entity_rect.x = clamp(entity_rect.x, 0, WIDTH - entity_rect.width)
+    entity_rect.y = clamp(entity_rect.y, 0, HEIGHT - entity_rect.height)
+    return entity_rect
+
+
+def draw_entity(surface, image, rect, fallback_color, border_color):
+    if image:
+        sprite = pygame.transform.smoothscale(image, (rect.width, rect.height))
+        surface.blit(sprite, rect.topleft)
+    else:
+        pygame.draw.rect(surface, fallback_color, rect, border_radius=12)
+        pygame.draw.rect(surface, border_color, rect, 2, border_radius=12)
+
+
+player_img = load_image_safe("images/player.png", (82, 82))
+enemy_img = load_image_safe("images/enemy.png", (68, 68))
+bullet_img = load_image_safe("images/bullet.png", (16, 28))
+gun_images = [
+    load_image_safe("images/gun1.jpg", (68, 42)),
+    load_image_safe("images/gun2.jpg", (68, 42)),
+    load_image_safe("images/gun3.jpg", (68, 42)),
+    load_image_safe("images/gun4.jpg", (68, 42)),
+    load_image_safe("images/gun5.jpg", (68, 42)),
+]
+
+shoot_sounds = [
+    load_sound_safe("sounds/gun1.wav", 0.35),
+    load_sound_safe("sounds/gun2.mp3", 0.35),
+    load_sound_safe("sounds/gun3.mp3", 0.35),
+    load_sound_safe("sounds/gun4.mp3", 0.35),
+    load_sound_safe("sounds/gun5.mp3", 0.35),
+]
+
+music_loaded = False
+if audio_ok:
+    try:
+        pygame.mixer.music.load("sounds/bg_music.mp3")
+        pygame.mixer.music.set_volume(0.28)
+        music_loaded = True
+    except Exception as e:
+        print("Background music load failed:", e)
+
+GUNS = [
+    {"name": "Pistol", "bullet_speed": 14, "damage": 18, "fire_delay": 260, "magazine": 12, "reserve": 72, "reload_time": 1000, "spread": 0.03, "color": (245, 228, 120)},
+    {"name": "SMG", "bullet_speed": 16, "damage": 11, "fire_delay": 90, "magazine": 28, "reserve": 180, "reload_time": 1200, "spread": 0.08, "color": (120, 220, 255)},
+    {"name": "Rifle", "bullet_speed": 17, "damage": 16, "fire_delay": 150, "magazine": 30, "reserve": 150, "reload_time": 1400, "spread": 0.04, "color": (120, 255, 145)},
+    {"name": "Shotgun", "bullet_speed": 13, "damage": 9, "fire_delay": 520, "magazine": 6, "reserve": 36, "reload_time": 1600, "pellets": 5, "spread": 0.22, "color": (255, 178, 86)},
+    {"name": "Sniper", "bullet_speed": 23, "damage": 48, "fire_delay": 850, "magazine": 5, "reserve": 25, "reload_time": 1800, "spread": 0.01, "color": (255, 110, 110)},
+]
+
+MAP_BUILDINGS = [
+    pygame.Rect(150, 120, 170, 150),
+    pygame.Rect(520, 90, 220, 120),
+    pygame.Rect(980, 120, 240, 140),
+    pygame.Rect(1280, 210, 180, 170),
+    pygame.Rect(240, 430, 210, 150),
+    pygame.Rect(820, 370, 210, 200),
+    pygame.Rect(1180, 520, 240, 160),
+    pygame.Rect(520, 660, 190, 130),
+]
+
+MAP_WATER_PATCHES = [
+    pygame.Rect(60, 670, 260, 150),
+    pygame.Rect(1360, 60, 170, 170),
+]
+
+MAP_ROADS = [
+    pygame.Rect(0, 300, WIDTH, 80),
+    pygame.Rect(720, 0, 95, HEIGHT),
+]
+
+DECOR_CIRCLES = [
+    (100, 80, 80),
+    (420, 230, 120),
+    (930, 700, 120),
+    (1380, 780, 110),
+]
+
+SCENERY_TREES = [
+    (88, 220, 24),
+    (404, 96, 20),
+    (460, 778, 22),
+    (904, 82, 24),
+    (1034, 312, 20),
+    (1510, 492, 18),
+    (1460, 820, 22),
+]
+
+SCENERY_CRATES = [
+    pygame.Rect(364, 340, 40, 40),
+    pygame.Rect(1132, 308, 44, 44),
+    pygame.Rect(760, 612, 42, 42),
+    pygame.Rect(1260, 438, 42, 42),
+]
+
+PLAYER_SIZE = (72, 72)
+ENEMY_SIZE = (62, 62)
+PLAYER_MAX_HEALTH = 100
+
+init_database(DB_PATH)
+persistent_stats, recent_matches = load_game_data(DB_PATH)
+
+score = 0
+high_score = persistent_stats["high_score"]
+level = 1
+paused = False
+game_over = False
+game_started = False
+current_gun = 2
+last_shot_time = 0
+reloading = False
+reload_end_time = 0
+display_health = PLAYER_MAX_HEALTH
+zone_radius = 560
+zone_target_radius = 560
+zone_center = (WIDTH // 2, HEIGHT // 2)
+zone_stage = 1
+next_zone_tick = 0
+zone_damage_timer = 0
+game_won = False
+match_start_time = 0
+match_recorded = False
+damage_dealt_total = 0.0
+damage_taken_total = 0.0
+hit_flash = 0
+match_duration = 0
+weather_phase = 0.0
+
+bullets = []
+enemy_bullets = []
+explosions = []
+enemies = []
+loot_items = []
+killfeed = []
+muzzle_flashes = []
+tracer_lines = []
+player_rect = pygame.Rect(WIDTH // 2 - 36, HEIGHT // 2 + 180, *PLAYER_SIZE)
+player_speed = 5.8
+player_health = PLAYER_MAX_HEALTH
+armor = 40
+medkits = 2
+player_direction = 0.0
+
+ammo_in_mag = GUNS[current_gun]["magazine"]
+ammo_reserve = GUNS[current_gun]["reserve"]
+
+start_button = pygame.Rect(WIDTH // 2 - 170, HEIGHT // 2 + 40, 340, 72)
+quit_button = pygame.Rect(WIDTH // 2 - 170, HEIGHT // 2 + 130, 340, 72)
+gun_buttons = []
+for i in range(len(GUNS)):
+    gun_buttons.append(pygame.Rect(22 + i * 104, HEIGHT - 70, 96, 46))
+
+
+def get_walls():
+    return MAP_BUILDINGS + MAP_WATER_PATCHES
+
+
+def refresh_persistent_data():
+    global persistent_stats, recent_matches, high_score
+    persistent_stats, recent_matches = load_game_data(DB_PATH)
+    high_score = persistent_stats["high_score"]
+
+
+def finalize_match():
+    global match_recorded, match_duration
+    if match_recorded or not game_over:
+        return
+
+    match_duration = max(0, (pygame.time.get_ticks() - match_start_time) / 1000)
+    record_match(
+        DB_PATH,
+        score=score,
+        won=game_won,
+        level_reached=level,
+        survival_seconds=match_duration,
+        damage_dealt=damage_dealt_total,
+        damage_taken=damage_taken_total,
+    )
+    match_recorded = True
+    refresh_persistent_data()
+
+
+def create_enemy(index=0):
+    spawn_points = [
+        (90, 90),
+        (WIDTH - 140, 120),
+        (WIDTH - 170, HEIGHT - 180),
+        (120, HEIGHT - 160),
+        (WIDTH // 2, 90),
+        (140, HEIGHT // 2),
+        (WIDTH - 160, HEIGHT // 2 + 80),
+    ]
+    spawn_x, spawn_y = spawn_points[index % len(spawn_points)]
+    gun_index = random.choice([0, 1, 2, 2, 3])
+    squad_names = ["Raven", "Cobra", "Ghost", "Falcon", "Nova", "Viper", "Blaze"]
+    return {
+        "rect": pygame.Rect(spawn_x, spawn_y, *ENEMY_SIZE),
+        "health": random.randint(58, 95),
+        "armor": random.randint(0, 35),
+        "speed": random.uniform(2.1, 3.4),
+        "gun": gun_index,
+        "last_shot": 0,
+        "fire_delay": GUNS[gun_index]["fire_delay"] + random.randint(60, 200),
+        "move_timer": 0,
+        "strafe": random.choice([-1, 1]),
+        "aggression": random.uniform(0.92, 1.18),
+        "name": f"{squad_names[index % len(squad_names)]}-{index + 1}",
+    }
+
+
+def create_loot(x, y, item_type):
+    return {"rect": pygame.Rect(int(x), int(y), 28, 28), "type": item_type, "pulse": 0}
+
+
+def reset_weapon_state(gun_index):
+    gun = GUNS[gun_index]
+    return gun["magazine"], gun["reserve"]
+
+
+def reset_game():
+    global score, level, paused, game_over, current_gun, last_shot_time
+    global reloading, reload_end_time, display_health, zone_radius, zone_target_radius
+    global zone_center, zone_stage, next_zone_tick, zone_damage_timer, game_won
+    global bullets, enemy_bullets, explosions, enemies, loot_items, killfeed
+    global player_rect, player_health, armor, medkits, player_direction
+    global ammo_in_mag, ammo_reserve, match_start_time, match_recorded
+    global damage_dealt_total, damage_taken_total, hit_flash, match_duration
+    global muzzle_flashes, tracer_lines, weather_phase
+
+    score = 0
+    level = 1
+    paused = False
+    game_over = False
+    game_won = False
+    current_gun = 2
+    last_shot_time = 0
+    reloading = False
+    reload_end_time = 0
+    player_rect = pygame.Rect(WIDTH // 2 - 36, HEIGHT // 2 + 180, *PLAYER_SIZE)
+    player_health = PLAYER_MAX_HEALTH
+    display_health = PLAYER_MAX_HEALTH
+    armor = 40
+    medkits = 2
+    player_direction = -math.pi / 2
+    ammo_in_mag, ammo_reserve = reset_weapon_state(current_gun)
+    bullets = []
+    enemy_bullets = []
+    explosions = []
+    muzzle_flashes = []
+    tracer_lines = []
+    enemies = [create_enemy(i) for i in range(7)]
+    loot_items = [
+        create_loot(364, 640, "ammo"),
+        create_loot(760, 245, "medkit"),
+        create_loot(1080, 670, "armor"),
+        create_loot(1320, 430, "ammo"),
+    ]
+    killfeed = []
+    zone_radius = 560
+    zone_target_radius = 560
+    zone_center = (WIDTH // 2, HEIGHT // 2)
+    zone_stage = 1
+    next_zone_tick = pygame.time.get_ticks() + 18000
+    zone_damage_timer = pygame.time.get_ticks()
+    match_start_time = pygame.time.get_ticks()
+    match_recorded = False
+    damage_dealt_total = 0.0
+    damage_taken_total = 0.0
+    hit_flash = 0
+    match_duration = 0
+    weather_phase = random.uniform(0, math.tau)
+
+
+def add_killfeed(message, color=WHITE):
+    killfeed.append({"text": message, "color": color, "ttl": 280})
+    if len(killfeed) > 5:
+        killfeed.pop(0)
+
+
+def start_reload():
+    global reloading, reload_end_time
+    gun = GUNS[current_gun]
+    if reloading or ammo_in_mag >= gun["magazine"] or ammo_reserve <= 0 or game_over:
+        return
+    reloading = True
+    reload_end_time = pygame.time.get_ticks() + gun["reload_time"]
+
+
+def finish_reload():
+    global reloading, ammo_in_mag, ammo_reserve
+    gun = GUNS[current_gun]
+    needed = gun["magazine"] - ammo_in_mag
+    if needed <= 0 or ammo_reserve <= 0:
+        reloading = False
+        return
+    moved = min(needed, ammo_reserve)
+    ammo_in_mag += moved
+    ammo_reserve -= moved
+    reloading = False
+
+
+def switch_gun(index):
+    global current_gun, ammo_in_mag, ammo_reserve, reloading
+    if index == current_gun or not (0 <= index < len(GUNS)):
+        return
+    current_gun = index
+    ammo_in_mag = min(ammo_in_mag, GUNS[current_gun]["magazine"])
+    ammo_reserve = max(ammo_reserve, GUNS[current_gun]["reserve"] // 2)
+    reloading = False
+
+
+def spawn_bullet(origin, target, speed, damage, owner, spread=0.0, color=YELLOW):
+    dx = target[0] - origin[0]
+    dy = target[1] - origin[1]
+    angle = math.atan2(dy, dx) + random.uniform(-spread, spread)
+    vx, vy = angle_to_vector(angle)
+    bullet = {
+        "x": origin[0],
+        "y": origin[1],
+        "vx": vx * speed,
+        "vy": vy * speed,
+        "damage": damage,
+        "owner": owner,
+        "life": 90,
+        "color": color,
+        "angle": angle,
+    }
+    tracer_lines.append(
+        {
+            "start": origin,
+            "end": (origin[0] + vx * 22, origin[1] + vy * 22),
+            "ttl": 4,
+            "color": color,
+        }
+    )
+    if owner == "player":
+        bullets.append(bullet)
+    else:
+        enemy_bullets.append(bullet)
+
+
+def fire_player_weapon():
+    global last_shot_time, ammo_in_mag
+    if game_over or reloading:
+        return
+    gun = GUNS[current_gun]
+    now = pygame.time.get_ticks()
+    if ammo_in_mag <= 0:
+        start_reload()
+        return
+    if now - last_shot_time < gun["fire_delay"]:
+        return
+
+    origin = player_rect.center
+    target = pygame.mouse.get_pos()
+    muzzle_flashes.append({"pos": origin, "ttl": 6, "color": gun["color"], "radius": 18})
+    pellets = gun.get("pellets", 1)
+    for _ in range(pellets):
+        spawn_bullet(
+            origin,
+            target,
+            gun["bullet_speed"],
+            gun["damage"],
+            "player",
+            spread=gun.get("spread", 0.02),
+            color=gun["color"],
+        )
+
+    if 0 <= current_gun < len(shoot_sounds) and shoot_sounds[current_gun]:
+        shoot_sounds[current_gun].stop()
+        shoot_sounds[current_gun].play()
+
+    ammo_in_mag -= 1
+    last_shot_time = now
+
+
+def enemy_can_see_player(enemy):
+    start = enemy["rect"].center
+    end = player_rect.center
+    for wall in get_walls():
+        if line_intersects_rect(start, end, wall):
+            return False
+    return True
+
+
+def damage_player(amount):
+    global player_health, armor, game_over, damage_taken_total, hit_flash
+    if armor > 0:
+        blocked = min(armor, amount * 0.55)
+        armor -= blocked
+        amount -= blocked
+    damage_taken_total += amount
+    player_health -= amount
+    hit_flash = min(12, hit_flash + 4)
+    if player_health <= 0 and not game_over:
+        player_health = 0
+        game_over = True
+
+
+def damage_enemy(enemy, amount):
+    global score, game_over, game_won, damage_dealt_total
+    absorbed = min(enemy.get("armor", 0), amount * 0.35)
+    enemy["armor"] = max(0, enemy.get("armor", 0) - absorbed)
+    real_damage = amount - absorbed
+    damage_dealt_total += real_damage
+    enemy["health"] -= real_damage
+    explosions.append({"pos": enemy["rect"].center, "radius": 14})
+    if enemy["health"] <= 0:
+        score += 1
+        loot_roll = random.random()
+        if loot_roll < 0.3:
+            loot_items.append(create_loot(enemy["rect"].centerx, enemy["rect"].centery, "ammo"))
+        elif loot_roll < 0.45:
+            loot_items.append(create_loot(enemy["rect"].centerx, enemy["rect"].centery, "medkit"))
+        elif loot_roll < 0.6:
+            loot_items.append(create_loot(enemy["rect"].centerx, enemy["rect"].centery, "armor"))
+        add_killfeed(f"{enemy['name']} eliminated", ORANGE)
+        enemies.remove(enemy)
+        if not enemies:
+            game_over = True
+            game_won = True
+
+
+def update_zone():
+    global zone_radius, zone_target_radius, zone_stage, next_zone_tick, zone_damage_timer
+    global game_over, game_won
+    now = pygame.time.get_ticks()
+    if now >= next_zone_tick and zone_stage < 5:
+        zone_stage += 1
+        zone_target_radius = max(140, 560 - zone_stage * 85)
+        next_zone_tick = now + 18000
+
+    if zone_radius > zone_target_radius:
+        zone_radius = max(zone_target_radius, zone_radius - 0.18)
+
+    if now - zone_damage_timer >= 1000:
+        zone_damage_timer = now
+        if not point_in_circle(player_rect.center, zone_center, zone_radius):
+            damage_player(4 + zone_stage)
+
+        for enemy in enemies[:]:
+            if not point_in_circle(enemy["rect"].center, zone_center, zone_radius):
+                enemy["health"] -= 5 + zone_stage
+                if enemy["health"] <= 0:
+                    add_killfeed(f"{enemy['name']} lost in zone", RED)
+                    enemies.remove(enemy)
+                    if not enemies:
+                        game_over = True
+                        game_won = True
+
+
+def update_loot():
+    global medkits, armor, ammo_reserve
+    for loot in loot_items[:]:
+        loot["pulse"] += 0.14
+        if player_rect.colliderect(loot["rect"]):
+            if loot["type"] == "ammo":
+                ammo_reserve += 30
+                add_killfeed("Ammo collected", CYAN)
+            elif loot["type"] == "medkit":
+                medkits = min(5, medkits + 1)
+                add_killfeed("Medkit collected", GREEN)
+            elif loot["type"] == "armor":
+                armor = min(100, armor + 25)
+                add_killfeed("Armor repaired", YELLOW)
+            loot_items.remove(loot)
+
+
+def use_medkit():
+    global medkits, player_health
+    if medkits <= 0 or player_health >= PLAYER_MAX_HEALTH or game_over:
+        return
+    medkits -= 1
+    player_health = min(PLAYER_MAX_HEALTH, player_health + 35)
+    add_killfeed("Medkit used", GREEN)
+
+
+def update_player(keys):
+    global player_direction
+    if game_over:
+        return
+
+    dx = 0
+    dy = 0
+    if keys[pygame.K_a] or keys[pygame.K_LEFT]:
+        dx -= player_speed
+    if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
+        dx += player_speed
+    if keys[pygame.K_w] or keys[pygame.K_UP]:
+        dy -= player_speed
+    if keys[pygame.K_s] or keys[pygame.K_DOWN]:
+        dy += player_speed
+
+    if dx and dy:
+        dx *= 0.707
+        dy *= 0.707
+
+    move_with_collisions(player_rect, dx, dy, get_walls())
+    mouse_pos = pygame.mouse.get_pos()
+    player_direction = math.atan2(mouse_pos[1] - player_rect.centery, mouse_pos[0] - player_rect.centerx)
+
+
+def update_player_bullets():
+    walls = get_walls()
+    for bullet in bullets[:]:
+        bullet["x"] += bullet["vx"]
+        bullet["y"] += bullet["vy"]
+        bullet["life"] -= 1
+        bullet_rect = pygame.Rect(int(bullet["x"] - 4), int(bullet["y"] - 4), 8, 8)
+
+        if any(bullet_rect.colliderect(wall) for wall in walls) or bullet["life"] <= 0:
+            bullets.remove(bullet)
+            continue
+
+        for enemy in enemies[:]:
+            if bullet_rect.colliderect(enemy["rect"]):
+                damage_enemy(enemy, bullet["damage"])
+                if bullet in bullets:
+                    bullets.remove(bullet)
+                break
+
+
+def update_enemy_ai():
+    now = pygame.time.get_ticks()
+    walls = get_walls()
+    for enemy in enemies[:]:
+        rect = enemy["rect"]
+        px, py = player_rect.center
+        ex, ey = rect.center
+        dx = px - ex
+        dy = py - ey
+        dist = math.hypot(dx, dy)
+        ndx, ndy = normalize_vector(dx, dy)
+
+        move_x = 0
+        move_y = 0
+        if dist > 280:
+            move_x = ndx * enemy["speed"] * enemy["aggression"]
+            move_y = ndy * enemy["speed"] * enemy["aggression"]
+        elif dist < 170:
+            move_x = -ndx * enemy["speed"] * 0.88
+            move_y = -ndy * enemy["speed"] * 0.88
+        else:
+            move_x = ndy * enemy["strafe"] * enemy["speed"] * 0.75
+            move_y = -ndx * enemy["strafe"] * enemy["speed"] * 0.75
+
+        if now > enemy["move_timer"]:
+            enemy["move_timer"] = now + random.randint(800, 1800)
+            enemy["strafe"] *= random.choice([-1, 1])
+
+        move_with_collisions(rect, move_x, move_y, walls)
+
+        if rect.colliderect(player_rect):
+            damage_player(0.28)
+
+        if enemy_can_see_player(enemy) and dist < 620 and now - enemy["last_shot"] >= enemy["fire_delay"]:
+            gun = GUNS[enemy["gun"]]
+            muzzle_flashes.append({"pos": rect.center, "ttl": 5, "color": (255, 130, 130), "radius": 14})
+            spawn_bullet(
+                rect.center,
+                player_rect.center,
+                gun["bullet_speed"] * 0.88,
+                max(8, gun["damage"] * 0.75),
+                "enemy",
+                spread=max(0.035, gun.get("spread", 0.05) * (1.18 + dist / 1200)),
+                color=(255, 110, 110),
+            )
+            enemy["last_shot"] = now
+
+
+def update_enemy_bullets():
+    walls = get_walls()
+    for bullet in enemy_bullets[:]:
+        bullet["x"] += bullet["vx"]
+        bullet["y"] += bullet["vy"]
+        bullet["life"] -= 1
+        bullet_rect = pygame.Rect(int(bullet["x"] - 4), int(bullet["y"] - 4), 8, 8)
+
+        if bullet["life"] <= 0 or any(bullet_rect.colliderect(wall) for wall in walls):
+            enemy_bullets.remove(bullet)
+            continue
+
+        if bullet_rect.colliderect(player_rect):
+            damage_player(bullet["damage"])
+            enemy_bullets.remove(bullet)
+
+
+def update_effects():
+    global hit_flash
+    for exp in explosions[:]:
+        exp["radius"] += 1.6
+        if exp["radius"] > 34:
+            explosions.remove(exp)
+
+    for item in killfeed[:]:
+        item["ttl"] -= 1
+        if item["ttl"] <= 0:
+            killfeed.remove(item)
+
+    for flash in muzzle_flashes[:]:
+        flash["ttl"] -= 1
+        if flash["ttl"] <= 0:
+            muzzle_flashes.remove(flash)
+
+    for tracer in tracer_lines[:]:
+        tracer["ttl"] -= 1
+        if tracer["ttl"] <= 0:
+            tracer_lines.remove(tracer)
+
+    if hit_flash > 0:
+        hit_flash -= 1
+
+
+def update_progression():
+    global level
+    if score >= 10:
+        level = 4
+    elif score >= 7:
+        level = 3
+    elif score >= 4:
+        level = 2
+    else:
+        level = 1
+
+
+def draw_health_bar(x, y, health, max_health, width=220, color=GREEN):
+    pygame.draw.rect(screen, (70, 20, 20), (x, y, width, 22), border_radius=8)
+    fill_width = int(width * (health / max_health))
+    pygame.draw.rect(screen, color, (x, y, max(0, fill_width), 22), border_radius=8)
+    pygame.draw.rect(screen, WHITE, (x, y, width, 22), 2, border_radius=8)
+
+
+def draw_map():
+    base_map = pygame.Surface((WIDTH, HEIGHT))
+    draw_vertical_gradient(base_map, (52, 96, 60), (30, 58, 40))
+    screen.blit(base_map, (0, 0))
+
+    for x, y, radius in DECOR_CIRCLES:
+        pygame.draw.circle(screen, MAP_GRASS_2, (x, y), radius)
+        pygame.draw.circle(screen, (86, 145, 92), (x - 18, y - 12), max(12, radius // 3))
+
+    for road in MAP_ROADS:
+        shadow = road.move(6, 6)
+        pygame.draw.rect(screen, (70, 67, 58), shadow, border_radius=8)
+        pygame.draw.rect(screen, MAP_ROAD, road)
+        if road.width > road.height:
+            for line_x in range(20, WIDTH, 80):
+                pygame.draw.rect(screen, (230, 218, 190), (line_x, road.centery - 4, 38, 8), border_radius=4)
+            pygame.draw.line(screen, (145, 135, 112), (road.left, road.top + 8), (road.right, road.top + 8), 3)
+        else:
+            for line_y in range(15, HEIGHT, 80):
+                pygame.draw.rect(screen, (230, 218, 190), (road.centerx - 4, line_y, 8, 38), border_radius=4)
+            pygame.draw.line(screen, (145, 135, 112), (road.left + 8, road.top), (road.left + 8, road.bottom), 3)
+
+    for patch in MAP_WATER_PATCHES:
+        pygame.draw.rect(screen, (38, 76, 110), patch.move(8, 8), border_radius=28)
+        pygame.draw.rect(screen, MAP_WATER, patch, border_radius=28)
+        pygame.draw.rect(screen, (175, 235, 255), patch, 3, border_radius=28)
+        ripple_offset = int(math.sin(pygame.time.get_ticks() / 420 + patch.x * 0.01) * 8)
+        ripple = patch.inflate(-46, -70).move(ripple_offset, 0)
+        pygame.draw.ellipse(screen, (96, 170, 220), ripple, 3)
+
+    for tree_x, tree_y, size in SCENERY_TREES:
+        pygame.draw.ellipse(screen, (20, 35, 18), (tree_x - size, tree_y + size - 4, size * 2 + 14, size + 10))
+        pygame.draw.rect(screen, (92, 60, 36), (tree_x - 6, tree_y + size - 4, 12, 24), border_radius=4)
+        pygame.draw.circle(screen, (38, 82, 42), (tree_x, tree_y), size + 6)
+        pygame.draw.circle(screen, (64, 122, 66), (tree_x - 5, tree_y - 8), size)
+
+    for crate in SCENERY_CRATES:
+        pygame.draw.rect(screen, (65, 46, 31), crate.move(4, 4), border_radius=6)
+        pygame.draw.rect(screen, (130, 92, 58), crate, border_radius=6)
+        pygame.draw.line(screen, (184, 145, 102), crate.topleft, crate.bottomright, 2)
+        pygame.draw.line(screen, (184, 145, 102), crate.topright, crate.bottomleft, 2)
+
+    for building in MAP_BUILDINGS:
+        pygame.draw.rect(screen, (76, 56, 42), building.move(10, 10), border_radius=18)
+        pygame.draw.rect(screen, MAP_BUILDING, building, border_radius=18)
+        pygame.draw.rect(screen, (239, 221, 198), building, 3, border_radius=18)
+        roof = building.inflate(-20, -20)
+        pygame.draw.rect(screen, (173, 129, 93), roof, border_radius=14)
+        door = pygame.Rect(building.centerx - 14, building.bottom - 28, 28, 28)
+        pygame.draw.rect(screen, DARK, door, border_radius=6)
+        for row in range(2):
+            for col in range(3):
+                window = pygame.Rect(building.x + 22 + col * 48, building.y + 22 + row * 40, 20, 16)
+                if window.right < building.right - 20 and window.bottom < building.bottom - 35:
+                    pygame.draw.rect(screen, (211, 230, 245), window, border_radius=4)
+
+    zone_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    zone_surface.fill((35, 65, 120, 108))
+    pygame.draw.circle(zone_surface, (0, 0, 0, 0), zone_center, int(zone_radius))
+    screen.blit(zone_surface, (0, 0))
+    pygame.draw.circle(screen, ZONE_BLUE, zone_center, int(zone_radius), 4)
+    haze = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    haze_alpha = 30 + int((math.sin(pygame.time.get_ticks() / 2200 + weather_phase) + 1) * 14)
+    haze.fill((220, 235, 255, haze_alpha))
+    screen.blit(haze, (0, 0))
+
+
+def draw_loot():
+    for loot in loot_items:
+        pulse_size = int(loot["pulse"] * 4) % 6
+        rect = loot["rect"].inflate(pulse_size, pulse_size)
+        color = CYAN
+        label = "AM"
+        if loot["type"] == "medkit":
+            color = GREEN
+            label = "+"
+        elif loot["type"] == "armor":
+            color = YELLOW
+            label = "AR"
+        pygame.draw.rect(screen, color, rect, border_radius=10)
+        pygame.draw.rect(screen, WHITE, rect, 2, border_radius=10)
+        text = small_font.render(label, True, BLACK)
+        screen.blit(text, text.get_rect(center=rect.center))
+
+
+def draw_bullets():
+    for bullet in bullets + enemy_bullets:
+        if bullet_img:
+            rotated = pygame.transform.rotate(bullet_img, -math.degrees(bullet["angle"]) - 90)
+            bullet_rect = rotated.get_rect(center=(int(bullet["x"]), int(bullet["y"])))
+            screen.blit(rotated, bullet_rect)
+        else:
+            pygame.draw.circle(screen, bullet["color"], (int(bullet["x"]), int(bullet["y"])), 4)
+
+
+def draw_entities():
+    pygame.draw.ellipse(screen, (0, 0, 0, 70), (player_rect.x + 6, player_rect.bottom - 10, player_rect.width - 12, 18))
+    if player_img:
+        angle = -math.degrees(player_direction) - 90
+        rotated = pygame.transform.rotate(player_img, angle)
+        rect = rotated.get_rect(center=player_rect.center)
+        screen.blit(rotated, rect.topleft)
+    else:
+        draw_entity(screen, None, player_rect, (70, 190, 255), WHITE)
+
+    gun_sprite = gun_images[current_gun] if current_gun < len(gun_images) else None
+    if gun_sprite:
+        gun_angle = -math.degrees(player_direction)
+        rotated_gun = pygame.transform.rotate(gun_sprite, gun_angle)
+        gun_rect = rotated_gun.get_rect(center=player_rect.center)
+        screen.blit(rotated_gun, gun_rect)
+
+    for enemy in enemies:
+        rect = enemy["rect"]
+        pygame.draw.ellipse(screen, (0, 0, 0, 70), (rect.x + 6, rect.bottom - 10, rect.width - 12, 18))
+        if enemy_img:
+            angle = -math.degrees(math.atan2(player_rect.centery - rect.centery, player_rect.centerx - rect.centerx)) - 90
+            rotated_enemy = pygame.transform.rotate(enemy_img, angle)
+            enemy_draw_rect = rotated_enemy.get_rect(center=rect.center)
+            screen.blit(rotated_enemy, enemy_draw_rect.topleft)
+        else:
+            draw_entity(screen, None, rect, (235, 90, 90), WHITE)
+        draw_health_bar(rect.x - 10, rect.y - 18, max(0, enemy["health"]), 90, width=82, color=RED)
+        if enemy.get("armor", 0) > 0:
+            draw_health_bar(rect.x - 10, rect.y - 32, enemy["armor"], 35, width=82, color=CYAN)
+
+
+def draw_effects():
+    for tracer in tracer_lines:
+        pygame.draw.line(screen, tracer["color"], tracer["start"], tracer["end"], 2)
+
+    for flash in muzzle_flashes:
+        alpha = max(30, flash["ttl"] * 40)
+        flash_surface = pygame.Surface((flash["radius"] * 4, flash["radius"] * 4), pygame.SRCALPHA)
+        center = flash_surface.get_width() // 2
+        pygame.draw.circle(flash_surface, (*flash["color"], alpha), (center, center), flash["radius"])
+        pygame.draw.circle(flash_surface, (255, 250, 220, alpha), (center, center), max(3, flash["radius"] // 2))
+        screen.blit(flash_surface, flash_surface.get_rect(center=flash["pos"]))
+
+    for exp in explosions:
+        pygame.draw.circle(screen, ORANGE, exp["pos"], int(exp["radius"]))
+        pygame.draw.circle(screen, YELLOW, exp["pos"], max(2, int(exp["radius"] * 0.5)))
+
+    if player_health < 36 or hit_flash > 0:
+        warning = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        warning_alpha = 34 + hit_flash * 9 + max(0, 36 - player_health)
+        pygame.draw.rect(warning, (255, 40, 40, min(160, warning_alpha)), (0, 0, WIDTH, HEIGHT), width=28)
+        screen.blit(warning, (0, 0))
+
+
+def draw_minimap():
+    mini = pygame.Rect(WIDTH - 245, HEIGHT - 200, 210, 160)
+    pygame.draw.rect(screen, (18, 22, 28), mini, border_radius=18)
+    pygame.draw.rect(screen, WHITE, mini, 2, border_radius=18)
+
+    scale_x = mini.width / WIDTH
+    scale_y = mini.height / HEIGHT
+
+    for building in MAP_BUILDINGS:
+        pygame.draw.rect(
+            screen,
+            MAP_BUILDING,
+            (
+                mini.x + int(building.x * scale_x),
+                mini.y + int(building.y * scale_y),
+                max(6, int(building.width * scale_x)),
+                max(6, int(building.height * scale_y)),
+            ),
+            border_radius=3,
+        )
+
+    pygame.draw.circle(
+        screen,
+        ZONE_WARNING,
+        (mini.x + int(zone_center[0] * scale_x), mini.y + int(zone_center[1] * scale_y)),
+        max(8, int(zone_radius * scale_x)),
+        2,
+    )
+    pygame.draw.circle(screen, GREEN, (mini.x + int(player_rect.centerx * scale_x), mini.y + int(player_rect.centery * scale_y)), 5)
+    for enemy in enemies:
+        pygame.draw.circle(screen, RED, (mini.x + int(enemy["rect"].centerx * scale_x), mini.y + int(enemy["rect"].centery * scale_y)), 4)
+
+    draw_text("Mini Map", WHITE, mini.x + 58, mini.y - 28, use_small=True)
+
+
+def draw_hud():
+    survival_time = (pygame.time.get_ticks() - match_start_time) / 1000 if game_started else 0
+    matches = max(1, persistent_stats["matches_played"])
+    win_rate = (persistent_stats["wins"] / matches) * 100 if persistent_stats["matches_played"] else 0
+
+    panel = pygame.Rect(18, 18, 520, 246)
+    pygame.draw.rect(screen, (12, 16, 22), panel, border_radius=20)
+    pygame.draw.rect(screen, WHITE, panel, 2, border_radius=20)
+
+    draw_text(f"Alive: {len(enemies) + 1}", CYAN, 34, 30)
+    draw_text(f"Kills: {score}", ORANGE, 34, 62)
+    draw_text(f"Level: {level}", YELLOW, 34, 94)
+    draw_text(f"Gun: {GUNS[current_gun]['name']}", GREEN, 34, 126)
+    draw_text(f"Ammo: {ammo_in_mag}/{ammo_reserve}", WHITE, 34, 158)
+    draw_text(f"Medkits: {medkits}", GREEN, 250, 158)
+    draw_text(f"Best: {high_score}", YELLOW, 250, 30)
+    draw_text(f"Time: {format_seconds(survival_time)}", WHITE, 250, 62)
+    draw_text(f"Win Rate: {win_rate:.0f}%", CYAN, 250, 94)
+    draw_text(f"Career Kills: {persistent_stats['total_kills']}", ORANGE, 250, 126)
+
+    draw_health_bar(34, 198, display_health, PLAYER_MAX_HEALTH, width=220, color=GREEN)
+    draw_health_bar(266, 198, armor, 100, width=220, color=CYAN)
+    draw_text(f"Damage Out: {int(damage_dealt_total)}", WHITE, 34, 226, use_small=True)
+    draw_text(f"Damage In: {int(damage_taken_total)}", WHITE, 266, 226, use_small=True)
+
+    draw_text(f"Zone {zone_stage}", ZONE_WARNING, WIDTH - 250, 22)
+    if reloading:
+        draw_text("Reloading...", ORANGE, WIDTH - 250, 54)
+    else:
+        draw_text("Mouse = Aim / Shoot", WHITE, WIDTH - 330, 54, use_small=True)
+    draw_text("R = Reload  H = Heal  P = Pause", WHITE, WIDTH - 400, 86, use_small=True)
+
+    for i, rect in enumerate(gun_buttons):
+        color = GUNS[i]["color"] if i == current_gun else (95, 105, 115)
+        pygame.draw.rect(screen, color, rect, border_radius=10)
+        pygame.draw.rect(screen, WHITE, rect, 2, border_radius=10)
+        label = small_font.render(f"{i + 1} {GUNS[i]['name']}", True, BLACK)
+        screen.blit(label, label.get_rect(center=rect.center))
+
+    for idx, item in enumerate(reversed(killfeed)):
+        draw_text(item["text"], item["color"], WIDTH - 330, 132 + idx * 28, use_small=True)
+
+
+def draw_crosshair():
+    mx, my = pygame.mouse.get_pos()
+    pygame.draw.circle(screen, WHITE, (mx, my), 13, 2)
+    pygame.draw.line(screen, WHITE, (mx - 18, my), (mx - 6, my), 2)
+    pygame.draw.line(screen, WHITE, (mx + 6, my), (mx + 18, my), 2)
+    pygame.draw.line(screen, WHITE, (mx, my - 18), (mx, my - 6), 2)
+    pygame.draw.line(screen, WHITE, (mx, my + 6), (mx, my + 18), 2)
+
+
+def draw_main_menu():
+    draw_map()
+
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 150))
+    screen.blit(overlay, (0, 0))
+
+    card = pygame.Rect(WIDTH // 2 - 360, HEIGHT // 2 - 220, 720, 470)
+    pygame.draw.rect(screen, (18, 22, 28), card, border_radius=24)
+    pygame.draw.rect(screen, WHITE, card, 2, border_radius=24)
+
+    draw_center_text("FREE FIRE 2D ARENA", YELLOW, HEIGHT // 2 - 110, use_big=True)
+    draw_center_text("Battle royale inspired survival mode", WHITE, HEIGHT // 2 - 46)
+    draw_center_text("Safe zone, smarter bots, live combat feel and persistent career stats", GRAY, HEIGHT // 2 - 10)
+
+    pygame.draw.rect(screen, ORANGE, start_button, border_radius=14)
+    pygame.draw.rect(screen, RED, quit_button, border_radius=14)
+    draw_center_text("START MATCH", BLACK, start_button.centery)
+    draw_center_text("QUIT", WHITE, quit_button.centery)
+
+    draw_center_text("Controls: WASD / Arrow, Mouse Shoot, 1-5 Guns, H Heal", CYAN, HEIGHT // 2 + 205)
+    draw_center_text(
+        f"Matches {persistent_stats['matches_played']}  |  Wins {persistent_stats['wins']}  |  Best {persistent_stats['high_score']}",
+        WHITE,
+        HEIGHT // 2 + 244,
+    )
+
+    history_y = HEIGHT // 2 + 278
+    draw_text("Recent Matches", YELLOW, WIDTH // 2 - 308, history_y, use_small=True)
+    if recent_matches:
+        for index, match in enumerate(recent_matches[:3]):
+            outcome = "Booyah" if match["won"] else "Out"
+            line = f"{outcome}  Kills {match['score']}  Time {format_seconds(match['survival_seconds'])}"
+            draw_text(line, WHITE, WIDTH // 2 - 308, history_y + 28 + index * 26, use_small=True)
+    else:
+        draw_text("First match will be saved in database automatically", WHITE, WIDTH // 2 - 308, history_y + 28, use_small=True)
+
+
+def draw_end_screen():
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 165))
+    screen.blit(overlay, (0, 0))
+
+    title = "BOOYAH!" if game_won else "GAME OVER"
+    title_color = GREEN if game_won else RED
+    draw_center_text(title, title_color, HEIGHT // 2 - 46, use_big=True)
+    draw_center_text(f"Kills: {score}   High Score: {high_score}", WHITE, HEIGHT // 2 + 18)
+    draw_center_text(
+        f"Survival: {format_seconds(match_duration)}   Damage: {int(damage_dealt_total)} dealt / {int(damage_taken_total)} taken",
+        CYAN,
+        HEIGHT // 2 + 58,
+    )
+    draw_center_text("Press R to restart or M for menu", YELLOW, HEIGHT // 2 + 98)
+
+
+if music_loaded:
+    try:
+        pygame.mixer.music.play(-1)
+    except Exception as e:
+        print("Music play failed:", e)
+
+reset_game()
+
+running = True
+mouse_hold = False
+
+while running:
+    clock.tick(FPS)
+    now = pygame.time.get_ticks()
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+        if not game_started:
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if start_button.collidepoint(event.pos):
+                    game_started = True
+                    reset_game()
+                elif quit_button.collidepoint(event.pos):
+                    running = False
+            continue
+
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1 and not game_over:
+                mouse_hold = True
+                fire_player_weapon()
+            for i, rect in enumerate(gun_buttons):
+                if rect.collidepoint(event.pos):
+                    switch_gun(i)
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            mouse_hold = False
+
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_p:
+                paused = not paused
+            elif event.key == pygame.K_r:
+                if game_over:
+                    reset_game()
+                else:
+                    start_reload()
+            elif event.key == pygame.K_m and game_over:
+                game_started = False
+                paused = False
+            elif event.key == pygame.K_h:
+                use_medkit()
+            elif event.key == pygame.K_1:
+                switch_gun(0)
+            elif event.key == pygame.K_2:
+                switch_gun(1)
+            elif event.key == pygame.K_3:
+                switch_gun(2)
+            elif event.key == pygame.K_4:
+                switch_gun(3)
+            elif event.key == pygame.K_5:
+                switch_gun(4)
+
+    if not game_started:
+        draw_main_menu()
+        pygame.display.update()
+        continue
+
+    if paused:
+        draw_map()
+        draw_entities()
+        draw_bullets()
+        draw_loot()
+        draw_hud()
+        draw_minimap()
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 128))
+        screen.blit(overlay, (0, 0))
+        draw_center_text("GAME PAUSED", RED, HEIGHT // 2 - 10, use_big=True)
+        draw_center_text("Press P to resume", WHITE, HEIGHT // 2 + 44)
+        pygame.display.update()
+        continue
+
+    keys = pygame.key.get_pressed()
+
+    if reloading and now >= reload_end_time:
+        finish_reload()
+
+    if mouse_hold and pygame.mouse.get_pressed()[0]:
+        fire_player_weapon()
+
+    if not game_over:
+        update_player(keys)
+        update_player_bullets()
+        update_enemy_ai()
+        update_enemy_bullets()
+        update_zone()
+        update_loot()
+        update_progression()
+
+    if game_over:
+        finalize_match()
+
+    update_effects()
+
+    if display_health > player_health:
+        display_health = max(player_health, display_health - 0.7)
+    elif display_health < player_health:
+        display_health = min(player_health, display_health + 0.7)
+
+    draw_map()
+    draw_loot()
+    draw_entities()
+    draw_bullets()
+    draw_effects()
+    draw_hud()
+    draw_minimap()
+    draw_crosshair()
+
+    if game_over:
+        draw_end_screen()
+
+    pygame.display.update()
+
+pygame.quit()
+sys.exit()
